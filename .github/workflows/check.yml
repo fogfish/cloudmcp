@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       - uses: actions/checkout@v4
 
@@ -33,9 +33,6 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go test -coverprofile=profile.cov $(go list ./... | grep -v /examples/)
-        env:
-          ## GOPATH required to build serverless app inside unittest 
-          GOPATH: /home/runner/work/${{ github.event.repository.name }}/go
 
       - uses: shogo82148/actions-goveralls@v1
         continue-on-error: true
@@ -49,6 +46,38 @@ jobs:
         with:
           install-go: false
           working-directory: ${{ matrix.module }}
+
+  ##
+  ## Consumers resolve newer dependencies by minimum version selection,
+  ## the library must build and pass tests against the latest minor versions.
+  latest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        module: [".", "pkg/auth"]
+
+    steps:
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - uses: actions/checkout@v4
+
+      - name: go get -u
+        working-directory: ${{ matrix.module }}
+        run: |
+          go get -u ./...
+          go mod tidy
+
+      - name: go build
+        working-directory: ${{ matrix.module }}
+        run: |
+          go build ./...
+
+      - name: go test
+        working-directory: ${{ matrix.module }}
+        run: |
+          go test $(go list ./... | grep -v /examples/)
 
   finish:
       needs: unit

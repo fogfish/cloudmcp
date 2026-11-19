@@ -11,9 +11,8 @@ package cloudmcp
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
+	"path"
+	"runtime/debug"
 	"strings"
 
 	"github.com/aws/aws-cdk-go/awscdk/v2"
@@ -23,192 +22,243 @@ import (
 	"github.com/fogfish/scud"
 )
 
-// Serverless MCP Gateway, wraps MCP Server as defined by official Go SDK
-// into AWS API Gateway and Lambda deployment.
+// Gateway is the high-level builder of standalone MCP server deployment:
+// a stack with API Gateway, authorizer and the server function.
+//
+//	cloudmcp.New("cmd/mcp").
+//		Hostless().
+//		AccessApiKey("access", "secret").
+//		Build()
+//
+// Use NewServer within an existing CDK application instead.
 type Gateway struct {
-	f        Factory
-	app      awscdk.App
-	stack    awscdk.Stack
-	loggroup awslogs.LogGroup
+	lambda  string
+	module  string
+	name    string
+	route   string
+	gwprops *scud.GatewayProps
+	cors    []string
+	fprops  *awslambda.FunctionProps
 
-	gateway *scud.Gateway
-	authpub *scud.AuthorizerPublic
-	authkey *scud.AuthorizerBasic
-	authjwt *scud.AuthorizerJwt
+	access   func(*Server, *scud.Gateway, awscdk.Stack)
+	metadata bool
 }
 
-// Creates new Gateway builder for given MCP Server factory
-func New(f Factory) *Gateway {
-	name := servername(f)
+// New creates the builder for MCP server, whose main package is at the given
+// path relative to the main module (e.g. "cmd/mcp"). The main is written by
+// the project:
+//
+//	func main() {
+//		lambda.Start(serve.Handler(server.New))
+//	}
+func New(lambda string) *Gateway {
+	return &Gateway{
+		lambda: strings.Trim(lambda, "/"),
+		name:   path.Base(lambda),
+	}
+}
 
-	c := &Gateway{f: f}
-	c.app = awscdk.NewApp(nil)
-
-	c.stack = awscdk.NewStack(c.app, jsii.String(name),
-		&awscdk.StackProps{
-			Env: &awscdk.Environment{
-				Account: jsii.String(os.Getenv("CDK_DEFAULT_ACCOUNT")),
-				Region:  jsii.String(os.Getenv("CDK_DEFAULT_REGION")),
-			},
-		},
-	)
-
-	c.loggroup = awslogs.NewLogGroup(c.stack, jsii.String("Logs"),
-		&awslogs.LogGroupProps{
-			LogGroupName:  jsii.String(fmt.Sprintf("/app/%s", name)),
-			RemovalPolicy: awscdk.RemovalPolicy_DESTROY,
-			Retention:     awslogs.RetentionDays_FIVE_DAYS,
-		},
-	)
-
+// Module of the server's source code, default is the main module of
+// the CDK application.
+func (c *Gateway) Module(module string) *Gateway {
+	c.module = module
 	return c
 }
 
-// Configures gateway without custom domain, default API Gateway host will be used.
+// Name of the stack, default is the base name of the server's path.
+// Logs are written to the log group /app/{name}.
+func (c *Gateway) Name(name string) *Gateway {
+	c.name = name
+	return c
+}
+
+// Route of the server, default is /mcp (see ServerProps.Route).
+func (c *Gateway) Route(route string) *Gateway {
+	c.route = route
+	return c
+}
+
+// Function configures properties of the server function (e.g. memory,
+// environment). The timeout must be shorter than 30 seconds.
+func (c *Gateway) Function(props *awslambda.FunctionProps) *Gateway {
+	c.fprops = props
+	return c
+}
+
+// Hostless configures gateway without custom domain, the default API Gateway
+// host is used.
 func (c *Gateway) Hostless() *Gateway {
-	c.gateway = scud.NewGateway(c.stack, jsii.String("Gateway"),
-		&scud.GatewayProps{},
-	)
-
+	c.gwprops = &scud.GatewayProps{}
 	return c
 }
 
-// Configures gateway with custom domain and TLS certificate ARN.
+// Host configures gateway with custom domain and TLS certificate ARN.
 func (c *Gateway) Host(host, certificate string) *Gateway {
-	c.gateway = scud.NewGateway(c.stack, jsii.String("Gateway"),
-		&scud.GatewayProps{
-			Host:   jsii.String(host),
-			TlsArn: jsii.String(certificate),
-		},
-	)
-
+	c.gwprops = &scud.GatewayProps{
+		Host:   jsii.String(host),
+		TlsArn: jsii.String(certificate),
+	}
 	return c
 }
 
-// Configures gateway with custom properties.
+// Gateway configures gateway with custom properties.
 func (c *Gateway) Gateway(props *scud.GatewayProps) *Gateway {
-	c.gateway = scud.NewGateway(c.stack, jsii.String("Gateway"), props)
+	c.gwprops = props
 	return c
 }
 
-// Configures gateway with public access (no authentication).
+// Cors enables CORS for browser MCP clients from the origins,
+// allowing MCP protocol headers.
+func (c *Gateway) Cors(origins ...string) *Gateway {
+	c.cors = origins
+	return c
+}
+
+// AccessPublic configures public access (no authentication).
 func (c *Gateway) AccessPublic() *Gateway {
-	c.authpub = c.gateway.NewAuthorizerPublic()
+	c.access = func(s *Server, gw *scud.Gateway, _ awscdk.Stack) {
+		s.AllowAccessPublic(gw.NewAuthorizerPublic())
+	}
 	return c
 }
 
-// Configures gateway with API Key access, using basic digest
-// authentication with access and secret keys.
+// AccessApiKey configures API key access, using basic authentication with
+// access and secret keys.
 func (c *Gateway) AccessApiKey(access, secret string) *Gateway {
-	c.authkey = c.gateway.NewAuthorizerBasic(access, secret)
+	c.access = func(s *Server, gw *scud.Gateway, _ awscdk.Stack) {
+		s.AllowAccessApiKey(gw.NewAuthorizerBasic(access, secret))
+	}
 	return c
 }
 
-// Configures gateway with AWS Cognito access, using given user pool ARN
+// AccessAwsCognito configures AWS Cognito access, using given user pool ARN
 // and optional list of app clients.
 func (c *Gateway) AccessAwsCognito(cognitoArn string, clients ...string) *Gateway {
-	c.authjwt = c.gateway.NewAuthorizerCognito(cognitoArn, clients...)
+	c.access = func(s *Server, gw *scud.Gateway, _ awscdk.Stack) {
+		s.AllowAccessJWT(gw.NewAuthorizerCognito(cognitoArn, clients...))
+	}
 	return c
 }
 
-// Configures gateway with JWT access, using given issuer and optional
-// list of audiences.
+// AccessJWT configures JWT access, using given issuer and optional list of
+// audiences.
 func (c *Gateway) AccessJWT(issuer string, audience ...string) *Gateway {
-	c.authjwt = c.gateway.NewAuthorizerJwt(issuer, audience...)
+	c.access = func(s *Server, gw *scud.Gateway, _ awscdk.Stack) {
+		s.AllowAccessJWT(gw.NewAuthorizerJwt(issuer, audience...))
+	}
+	return c
+}
 
-	c.authpub = c.gateway.NewAuthorizerPublic()
+// AccessLambda configures the project's own Lambda authorizer, whose main
+// package is at the given path relative to the module (use package
+// github.com/fogfish/scud/authorizer to implement it).
+func (c *Gateway) AccessLambda(lambda string, props *scud.AuthorizerLambdaProps) *Gateway {
+	c.access = func(s *Server, gw *scud.Gateway, stack awscdk.Stack) {
+		f := scud.NewFunctionGo(stack, jsii.String("Authorizer"),
+			&scud.FunctionGoProps{
+				SourceCodeModule: c.module,
+				SourceCodeLambda: strings.Trim(lambda, "/"),
+			},
+		)
+		s.AllowAccessLambda(gw.NewAuthorizerLambda(f, props))
+	}
+	return c
+}
 
-	f := scud.NewFunctionGo(c.stack, jsii.String("JWKS"),
-		&scud.FunctionGoProps{
-			SourceCodeModule: "github.com/fogfish/cloudmcp",
-			SourceCodeLambda: "/internal/oauth2",
-			FunctionProps: &awslambda.FunctionProps{
-				LogGroup: c.loggroup,
-				Timeout:  awscdk.Duration_Minutes(jsii.Number(5)),
+// ResourceMetadata routes protected resource metadata (RFC 9728) to the server
+// as public routes. The server enables it with serve.WithResourceServer.
+func (c *Gateway) ResourceMetadata() *Gateway {
+	c.metadata = true
+	return c
+}
+
+// Stack defines the stack of the server within the application.
+func (c *Gateway) Stack(app awscdk.App) awscdk.Stack {
+	if c.access == nil {
+		panic(fmt.Errorf("cloudmcp: no access is defined for server %s", c.lambda))
+	}
+
+	if c.module == "" {
+		c.module = mainModule()
+	}
+
+	stack := awscdk.NewStack(app, jsii.String(c.name),
+		&awscdk.StackProps{
+			Env: &awscdk.Environment{
+				Account: getenv("CDK_DEFAULT_ACCOUNT"),
+				Region:  getenv("CDK_DEFAULT_REGION"),
 			},
 		},
 	)
 
-	c.authpub.AddResource("/oauth2", f)
+	scud.SetDefaults(stack,
+		&scud.Defaults{
+			LogGroup: awslogs.NewLogGroup(stack, jsii.String("Logs"),
+				&awslogs.LogGroupProps{
+					LogGroupName:  jsii.String(fmt.Sprintf("/app/%s", c.name)),
+					RemovalPolicy: awscdk.RemovalPolicy_DESTROY,
+					Retention:     awslogs.RetentionDays_FIVE_DAYS,
+				},
+			),
+		},
+	)
 
-	return c
-}
-
-func (c *Gateway) Build() {
-	if c.gateway == nil {
-		c.Hostless()
+	gwprops := c.gwprops
+	if gwprops == nil {
+		gwprops = &scud.GatewayProps{}
 	}
+	if len(c.cors) > 0 {
+		props := *gwprops
+		props.Cors = Cors(c.cors...)
+		gwprops = &props
+	}
+	gateway := scud.NewGateway(stack, jsii.String("Gateway"), gwprops)
 
-	module, lambda := sourcecode(c.f)
-	server := NewServer(c.stack, jsii.String(filepath.Base(lambda)),
-		NewServerProps(c.f, &scud.FunctionGoProps{
-			SourceCodeModule: module,
-			SourceCodeLambda: lambda,
-			FunctionProps: &awslambda.FunctionProps{
-				LogGroup: c.loggroup,
-				Timeout:  awscdk.Duration_Minutes(jsii.Number(5)),
+	server := NewServer(stack, jsii.String("Server"),
+		&ServerProps{
+			FunctionGoProps: &scud.FunctionGoProps{
+				SourceCodeModule: c.module,
+				SourceCodeLambda: c.lambda,
+				FunctionProps:    c.fprops,
 			},
-		}),
+			Route: c.route,
+		},
 	)
 
-	switch {
-	case c.authjwt != nil:
-		server.AllowAccessJWT(c.authjwt)
-	case c.authkey != nil:
-		server.AllowAccessApiKey(c.authkey)
-	case c.authpub != nil:
-		server.AllowAccessPublic(c.authpub)
-	default:
-		panic("no authorizer defined for server")
+	c.access(server, gateway, stack)
+
+	if c.metadata {
+		server.ServeResourceMetadata(gateway.NewAuthorizerPublic())
 	}
 
-	awscdk.NewCfnOutput(c.stack, jsii.String("Host"),
-		&awscdk.CfnOutputProps{Value: c.gateway.RestAPI.ApiEndpoint()},
+	awscdk.NewCfnOutput(stack, jsii.String("Host"),
+		&awscdk.CfnOutputProps{Value: gateway.RestAPI.ApiEndpoint()},
+	)
+	awscdk.NewCfnOutput(stack, jsii.String("Route"),
+		&awscdk.CfnOutputProps{Value: jsii.String(server.Route)},
 	)
 
-	c.app.Synth(nil)
+	return stack
 }
 
-func servername(f any) string {
-	fptr := reflect.ValueOf(f).Pointer()
-	fobj := runtime.FuncForPC(fptr)
-	if fobj == nil {
-		panic(fmt.Errorf("failed to discover function metadata"))
-	}
-
-	name := fobj.Name()
-	serv := filepath.Ext(name)[1:]
-
-	return serv
+// Build defines and synthesizes the application.
+func (c *Gateway) Build() {
+	app := awscdk.NewApp(nil)
+	c.Stack(app)
+	app.Synth(nil)
 }
 
-func sourcecode(f any) (string, string) {
-	fptr := reflect.ValueOf(f).Pointer()
-	fobj := runtime.FuncForPC(fptr)
-	if fobj == nil {
-		panic(fmt.Errorf("failed to discover function metadata"))
+// environment variable, nil if undefined (environment-agnostic stack)
+func getenv(key string) *string {
+	if v := os.Getenv(key); v != "" {
+		return jsii.String(v)
 	}
-
-	name := fobj.Name()
-	path := strings.TrimSuffix(name, filepath.Ext(name))
-
-	segs := strings.Split(path, "/")
-	for i := len(segs) - 1; i >= 0; i-- {
-		subpath := strings.Join(segs[:i], "/")
-		gomod := filepath.Join(subpath, "go.mod")
-		if _, err := os.Stat(rootSourceCode(gomod)); err == nil {
-			return subpath, strings.Join(segs[i:], "/")
-		}
-	}
-
-	panic(fmt.Errorf("failed to go.mod for function %s", path))
+	return nil
 }
 
-func rootSourceCode(sourceCodeModule string) string {
-	sourceCode := os.Getenv("GITHUB_WORKSPACE")
-	if sourceCode == "" {
-		sourceCode = filepath.Join(os.Getenv("GOPATH"), "src", sourceCodeModule)
+func mainModule() string {
+	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path != "" {
+		return info.Main.Path
 	}
-
-	return sourceCode
+	panic(fmt.Errorf("cloudmcp: unable to discover main module, use Module(...)"))
 }

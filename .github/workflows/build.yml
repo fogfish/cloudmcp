@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: "1.26"
 
       - uses: actions/checkout@v4
 
@@ -32,9 +32,6 @@ jobs:
         working-directory: ${{ matrix.module }}
         run: |
           go test -coverprofile=profile.cov $(go list ./... | grep -v /examples/)
-        env:
-          ## GOPATH required to build serverless app inside unittest 
-          GOPATH: /home/runner/work/${{ github.event.repository.name }}/go
 
       - uses: shogo82148/actions-goveralls@v1
         continue-on-error: true

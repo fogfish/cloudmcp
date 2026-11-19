@@ -28,40 +28,72 @@ type ConfigApiKey struct {
 	Client *http.Client
 }
 
-// NewApiKey creates MCP transport with API Key authentication.
+// NewTransportApiKey creates MCP transport with API Key authentication,
+// sending access and secret keys as standard (RFC 7617) Basic credentials.
 func NewTransportApiKey(spec ConfigApiKey) (*mcp.StreamableClientTransport, error) {
 	if len(spec.Url) == 0 {
 		return nil, errors.New("missing URL config")
 	}
 
-	digest := base64.RawStdEncoding.EncodeToString([]byte(spec.Access + ":" + spec.Secret))
+	digest := base64.StdEncoding.EncodeToString([]byte(spec.Access + ":" + spec.Secret))
 
-	sock := &apikeyTransport{
-		digest: digest,
-		socket: http.DefaultTransport,
+	return newTransport(spec.Url, spec.Client, "Basic "+digest), nil
+}
+
+// Configure Bearer token authentication for MCP client
+type ConfigBearer struct {
+	// Endpoint URL of MCP server
+	Url string
+
+	// Bearer token (e.g. API key issued as bearer token)
+	Token string
+
+	// Custom HTTP client (if nil, default client will be used)
+	Client *http.Client
+}
+
+// NewTransportBearer creates MCP transport with Bearer token authentication.
+func NewTransportBearer(spec ConfigBearer) (*mcp.StreamableClientTransport, error) {
+	if len(spec.Url) == 0 {
+		return nil, errors.New("missing URL config")
 	}
 
-	if spec.Client != nil && spec.Client.Transport != nil {
-		sock.socket = spec.Client.Transport
+	if len(spec.Token) == 0 {
+		return nil, errors.New("missing token config")
 	}
 
-	if spec.Client == nil {
-		spec.Client = &http.Client{}
+	return newTransport(spec.Url, spec.Client, "Bearer "+spec.Token), nil
+}
+
+func newTransport(url string, client *http.Client, authorization string) *mcp.StreamableClientTransport {
+	sock := &headerTransport{
+		authorization: authorization,
+		socket:        http.DefaultTransport,
 	}
-	spec.Client.Transport = sock
+
+	if client != nil && client.Transport != nil {
+		sock.socket = client.Transport
+	}
+
+	if client == nil {
+		client = &http.Client{}
+	}
+	client.Transport = sock
 
 	return &mcp.StreamableClientTransport{
-		Endpoint:   spec.Url,
-		HTTPClient: spec.Client,
-	}, nil
+		Endpoint:   url,
+		HTTPClient: client,
+	}
 }
 
-type apikeyTransport struct {
-	digest string
-	socket http.RoundTripper
+type headerTransport struct {
+	authorization string
+	socket        http.RoundTripper
 }
 
-func (api *apikeyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	req.Header.Add("Authorization", "Basic "+api.digest)
+func (api *headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// RoundTrip must not modify the request
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", api.authorization)
 	return api.socket.RoundTrip(req)
 }

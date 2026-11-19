@@ -27,12 +27,13 @@ func Sayer(ctx context.Context, req *mcp.CallToolRequest, input Input) (*mcp.Cal
 	return nil, Output{Greeting: "Hello World!", Author: input.Name}, nil
 }
 
-func HelloWorld() (*mcp.Server, error) {
+// New defines MCP server using the official Go SDK
+func New() *mcp.Server {
 	server := mcp.NewServer(
 		&mcp.Implementation{Name: "hello world", Version: "v1.0.0"},
 		nil,
 	)
 	mcp.AddTool(server, &mcp.Tool{Name: "sayer", Description: "says Hello World!"}, Sayer)
 
-	return server, nil
+	return server
 }

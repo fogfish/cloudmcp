@@ -9,45 +9,58 @@
 package main
 
 import (
-	"os"
-
 	"github.com/aws/aws-cdk-go/awscdk/v2"
+	"github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
 	"github.com/aws/jsii-runtime-go"
 	"github.com/fogfish/cloudmcp"
-	"github.com/fogfish/cloudmcp/examples/serverless/sayer"
 	"github.com/fogfish/scud"
 )
 
 func main() {
 	app := awscdk.NewApp(nil)
 
-	stack := awscdk.NewStack(app, jsii.String("CloudMCP"),
-		&awscdk.StackProps{
-			Env: &awscdk.Environment{
-				Account: jsii.String(os.Getenv("CDK_DEFAULT_ACCOUNT")),
-				Region:  jsii.String(os.Getenv("CDK_DEFAULT_REGION")),
-			},
-		},
+	stack := awscdk.NewStack(app, jsii.String("cloudmcp-serverless"), nil)
+
+	// the host application's conventions of functions and log groups
+	scud.SetDefaults(stack,
+		&scud.Defaults{LogGroupPrefix: "/cloudmcp-serverless"},
 	)
 
 	gateway := scud.NewGateway(stack, jsii.String("Gateway"),
-		&scud.GatewayProps{},
+		&scud.GatewayProps{
+			Cors: cloudmcp.Cors("http://localhost:6274"),
+		},
 	)
 	awscdk.NewCfnOutput(stack, jsii.String("Host"),
 		&awscdk.CfnOutputProps{Value: gateway.RestAPI.ApiEndpoint()},
 	)
 
-	authroizer := gateway.NewAuthorizerBasic("access", "secret")
-
-	f := cloudmcp.NewFunction(stack, jsii.String("Worker"),
-		cloudmcp.NewFunctionProps(sayer.Sayer, "says hi",
-			&scud.FunctionGoProps{
-				SourceCodeModule: "github.com/fogfish/cloudmcp",
-				SourceCodeLambda: "cmd/cloudmcp/sayer",
-			},
-		),
+	// worker functions, a tool per function with own IAM role
+	sayer := scud.NewFunctionGo(stack, jsii.String("Sayer"),
+		&scud.FunctionGoProps{
+			SourceCodeModule: "github.com/fogfish/cloudmcp",
+			SourceCodeLambda: "examples/serverless/cmd/sayer",
+		},
 	)
-	f.AllowAccessApiKey(authroizer)
+
+	clock := scud.NewFunctionGo(stack, jsii.String("Clock"),
+		&scud.FunctionGoProps{
+			SourceCodeModule: "github.com/fogfish/cloudmcp",
+			SourceCodeLambda: "examples/serverless/cmd/clock",
+		},
+	)
+
+	// the single MCP endpoint aggregating tools of workers
+	cloudmcp.NewDispatcher(stack, jsii.String("Dispatcher"),
+		&cloudmcp.DispatcherProps{
+			Name:             "serverless",
+			Route:            "/mcp",
+			MetricsNamespace: "cloudmcp/serverless",
+			Workers:          []awslambda.IFunction{sayer, clock},
+		},
+	).AllowAccessApiKey(
+		gateway.NewAuthorizerBasic("access", "secret"),
+	)
 
 	app.Synth(nil)
 }
