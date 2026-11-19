@@ -10,11 +10,11 @@ package main
 
 import (
 	"github.com/fogfish/cloudmcp"
-	"github.com/fogfish/cloudmcp/examples/helloworld/server"
 )
 
 func main() {
-	cloudmcp.New(server.HelloWorld).
+	cloudmcp.New("examples/helloworld/lambda").
+		Name("helloworld").
 		Hostless().
 		AccessApiKey("access", "secret").
 		Build()

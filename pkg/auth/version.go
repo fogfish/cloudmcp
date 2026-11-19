@@ -8,4 +8,4 @@
 
 package auth
 
-const Version = "pkg/auth/v0.0.1"
+const Version = "pkg/auth/v0.1.0"

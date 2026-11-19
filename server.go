@@ -10,155 +10,185 @@ package cloudmcp
 
 import (
 	"fmt"
-	"os"
-	"path/filepath"
-	"reflect"
-	"runtime"
 	"strings"
-	"time"
 
+	"github.com/aws/aws-cdk-go/awscdk/v2"
+	apigw2 "github.com/aws/aws-cdk-go/awscdk/v2/awsapigatewayv2"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awsiam"
 	"github.com/aws/aws-cdk-go/awscdk/v2/awslambda"
 	"github.com/aws/constructs-go/constructs/v10"
+	"github.com/aws/jsii-runtime-go"
 	"github.com/fogfish/scud"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// Factory is a function that constructs instance of MCP Server.
-//
-//	func HelloWorld() (*mcp.Server, error) {
-//		server := mcp.NewServer(...)
-//		mcp.AddTool(server, ...)
-//		return server, nil
-//	}
-type Factory = func() (*mcp.Server, error)
+// DefaultRoute of MCP server
+const DefaultRoute = "/mcp"
 
-// ServerProps defines properties for MCP Server as a Lambda function.
-// This construct assumes a function is running an instance of MCP Server.
-type ServerProps struct {
-	*scud.FunctionGoProps
-	Factory Factory
-	AutoGen bool
+// DefaultTimeout of MCP server function, shorter than the API Gateway HTTP API
+// integration timeout (30 seconds).
+var DefaultTimeout = awscdk.Duration_Seconds(jsii.Number(29))
+
+// maximum integration timeout of API Gateway HTTP API
+const maxTimeoutSeconds = 30
+
+// Methods of MCP route. The function answers GET and DELETE with 405
+// (stateless servers do not support event streams and sessions).
+var methods = []apigw2.HttpMethod{
+	apigw2.HttpMethod_POST,
+	apigw2.HttpMethod_GET,
+	apigw2.HttpMethod_DELETE,
 }
 
-// Helper utility to bind scud.FunctionGoProps with MCP Server Factory.
-func NewServerProps(f Factory, props *scud.FunctionGoProps) *ServerProps {
-	return &ServerProps{
-		FunctionGoProps: props,
-		Factory:         f,
+// ServerProps defines properties of MCP server as Lambda function.
+// The function's main is written by the project:
+//
+//	func main() {
+//		lambda.Start(serve.Handler(server.New))
+//	}
+type ServerProps struct {
+	// The function, built from SourceCodeModule/SourceCodeLambda.
+	// The timeout defaults to 29 seconds, it must be shorter than 30 seconds.
+	// The log group and other defaults follow scud.SetDefaults of the scope.
+	*scud.FunctionGoProps
+
+	// Route of the server (e.g. /mcp, /{instance} or /), default is /mcp.
+	// The route may contain path parameters, they are available to tools at
+	// req.Extra.TokenInfo.Extra["path"].
+	Route string
+
+	// Payload format of the integration, default is 2.0.
+	// The function accepts both 1.0 and 2.0.
+	PayloadFormatVersion apigw2.PayloadFormatVersion
+}
+
+// Server is L3 construct of MCP server as AWS Lambda function.
+type Server struct {
+	Route    string
+	Function awslambda.Function
+	payload  apigw2.PayloadFormatVersion
+}
+
+// NewServer defines MCP server as Lambda function.
+func NewServer(scope constructs.Construct, id *string, props *ServerProps) *Server {
+	if props == nil || props.FunctionGoProps == nil {
+		panic(fmt.Errorf("cloudmcp: server %s: FunctionGoProps is required", *id))
+	}
+
+	spec := *props.FunctionGoProps
+	spec.FunctionProps = withTimeout(*id, spec.FunctionProps)
+
+	return &Server{
+		Route:    route(props.Route),
+		Function: scud.NewFunctionGo(scope, id, &spec),
+		payload:  payload(props.PayloadFormatVersion),
 	}
 }
 
-// Force regeneration of the server binding code on each deployment.
-func (f *ServerProps) ForceAutoGen() *ServerProps {
-	f.AutoGen = true
-	return f
+func (c *Server) props() *scud.RouteProps {
+	return &scud.RouteProps{
+		Handler:              c.Function,
+		Methods:              methods,
+		PayloadFormatVersion: c.payload,
+	}
 }
 
-// L3 Construct for MCP Server as AWS Lambda function.
-// This construct assumes a function is running an instance of MCP Server.
-type Server struct {
-	uri      string
-	Function awslambda.Function
+// AllowAccessPublic grants public access to the server.
+func (c *Server) AllowAccessPublic(api *scud.AuthorizerPublic) *Server {
+	api.AddRoute(c.Route, c.props())
+	return c
 }
 
-// Defines MCP Server as a Lambda function.
-func NewServer(scope constructs.Construct, id *string, spec *ServerProps) *Server {
-	name, path := sautogen(spec.Factory, spec.SourceCodeModule, spec.AutoGen)
-	uri := "/" + strings.ToLower(name)
-	spec.SourceCodeLambda = filepath.Join(path, serverdir)
-	flambda := scud.NewFunctionGo(scope, id, spec.FunctionGoProps)
-
-	return &Server{uri: uri, Function: flambda}
+// AllowAccessApiKey grants access to the server via API key authorizer.
+func (c *Server) AllowAccessApiKey(api *scud.AuthorizerBasic) *Server {
+	api.AddRoute(c.Route, c.props())
+	return c
 }
 
-// Grants public access to the server via given public authorizer.
-func (c *Server) AllowAccessPublic(api *scud.AuthorizerPublic) {
-	api.AddResource(c.uri, c.Function)
+// AllowAccessJWT grants access to the server via JWT (or Cognito) authorizer,
+// requiring the given OAuth scopes.
+func (c *Server) AllowAccessJWT(api *scud.AuthorizerJwt, scope ...string) *Server {
+	props := c.props()
+	props.AuthorizationScopes = scope
+	api.AddRoute(c.Route, props)
+	return c
 }
 
-// Grants access to the server via given API key authorizer.
-func (c *Server) AllowAccessApiKey(api *scud.AuthorizerBasic) {
-	api.AddResource(c.uri, c.Function)
+// AllowAccessIAM grants access to the server via IAM authorizer for the principal.
+func (c *Server) AllowAccessIAM(api *scud.AuthorizerIAM, principal awsiam.IGrantable) *Server {
+	props := c.props()
+	props.Grantee = principal
+	api.AddRoute(c.Route, props)
+	return c
 }
 
-// Grants access to the server via given JWT authorizer.
-func (c *Server) AllowAccessJWT(api *scud.AuthorizerJwt, scope ...string) {
-	api.AddResource(c.uri, c.Function, scope...)
+// AllowAccessLambda grants access to the server via the project's own Lambda
+// authorizer (scud.Gateway.NewAuthorizerLambda). The authorizer's context is
+// available to tools at req.Extra.TokenInfo (see serve.DefaultTokenInfo).
+func (c *Server) AllowAccessLambda(api *scud.AuthorizerLambda) *Server {
+	api.AddRoute(c.Route, c.props())
+	return c
 }
 
-// Grants access to the server via given IAM authorizer.
-func (c *Server) AllowAccessIAM(api *scud.AuthorizerIAM, principal awsiam.IGrantable) {
-	api.AddResource(c.uri, c.Function, principal)
+// ServeResourceMetadata routes the protected resource metadata (RFC 9728) to
+// the server as public routes, see serve.WithResourceServer.
+func (c *Server) ServeResourceMetadata(api *scud.AuthorizerPublic) *Server {
+	for _, path := range []string{MetadataPath, MetadataPath + "/{proxy+}"} {
+		api.AddRoute(path,
+			&scud.RouteProps{
+				Handler:              c.Function,
+				Methods:              []apigw2.HttpMethod{apigw2.HttpMethod_GET},
+				PayloadFormatVersion: c.payload,
+			},
+		)
+	}
+	return c
 }
+
+// MetadataPath is the well-known path of protected resource metadata.
+const MetadataPath = "/.well-known/oauth-protected-resource"
 
 //------------------------------------------------------------------------------
 
-const serverdir = "autogen"
-
-func sautogen(f Factory, scModule string, force bool) (string, string) {
-	fptr := reflect.ValueOf(f).Pointer()
-	fobj := runtime.FuncForPC(fptr)
-	if fobj == nil {
-		panic(fmt.Errorf("failed to discover function metadata"))
+func route(r string) string {
+	if r == "" {
+		return DefaultRoute
 	}
-
-	name := fobj.Name()
-	serv := filepath.Ext(name)[1:]
-	path := strings.TrimSuffix(name, filepath.Ext(name))
-	base := filepath.Base(name)
-
-	code := fmt.Sprintf(`// DO NOT EDIT !!!
-// THE FILE IS AUTO GENERATED BY github.com/fogfish/cloudmcp
-// %s
-package main
-
-import (
-	"net/http"
-
-  "github.com/aws/aws-lambda-go/lambda"
-	"github.com/fogfish/cloudmcp/internal/gateway"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"%s"
-)
-
-func main() {
-	server, err := %s()
-	if err != nil {
-		panic(err)
+	if !strings.HasPrefix(r, "/") {
+		r = "/" + r
 	}
-
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return server
-	}, &mcp.StreamableHTTPOptions{
-		Stateless:    true,
-		JSONResponse: true,
-	})
-
-	srv := gateway.New(handler)
-
-	lambda.Start(srv.Serve)
+	return r
 }
-`, time.Now(), path, base)
 
-	gofile, _ := fobj.FileLine(fptr)
-	codepath := filepath.Join(filepath.Dir(gofile), serverdir, "main.go")
+func payload(v apigw2.PayloadFormatVersion) apigw2.PayloadFormatVersion {
+	if v == nil {
+		return apigw2.PayloadFormatVersion_VERSION_2_0()
+	}
+	return v
+}
 
-	if !force {
-		if _, err := os.Stat(codepath); err == nil {
-			// If the file already exists, we assume it has been generated before
-			return serv, strings.TrimPrefix(path, scModule)
+func withTimeout(id string, props *awslambda.FunctionProps) *awslambda.FunctionProps {
+	var spec awslambda.FunctionProps
+	if props != nil {
+		spec = *props
+	}
+
+	if spec.Timeout == nil {
+		spec.Timeout = DefaultTimeout
+	}
+
+	if sec, ok := seconds(spec.Timeout); ok && sec >= maxTimeoutSeconds {
+		panic(fmt.Errorf("cloudmcp: function %s: timeout %vs must be shorter than API Gateway integration timeout (%ds)", id, sec, maxTimeoutSeconds))
+	}
+
+	return &spec
+}
+
+// seconds of the duration, false if the duration is unresolved token
+func seconds(d awscdk.Duration) (sec float64, ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
 		}
-	}
-
-	err := os.MkdirAll(filepath.Dir(codepath), 0766)
-	if err != nil {
-		panic(err)
-	}
-	err = os.WriteFile(codepath, []byte(code), 0766)
-	if err != nil {
-		panic(err)
-	}
-
-	return serv, strings.TrimPrefix(path, scModule)
+	}()
+	return *d.ToSeconds(nil), true
 }
